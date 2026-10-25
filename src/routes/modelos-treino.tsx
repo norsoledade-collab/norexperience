@@ -4,10 +4,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   PERIOD_DAYS,
   PERIOD_WEEKS,
+  addExercisesToCurrentStructure,
   assignSequence,
+  buildSchedule,
   cloneBlocks,
   computeProgress,
   createSequence,
+  currentStructureAIContract,
   emptyBlock,
   formatDateBR,
   listActiveAssignments,
@@ -43,6 +46,7 @@ function ModelosTreinoPage() {
   const [draft, setDraft] = useState<TrainingSequence | null>(null);
   const [planChoices, setPlanChoices] = useState<Record<string, string>>({});
   const [startChoices, setStartChoices] = useState<Record<string, number>>({});
+  const [aiExerciseDrafts, setAiExerciseDrafts] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -157,6 +161,39 @@ function ModelosTreinoPage() {
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Não foi possível atribuir o modelo.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleStructureExercise = async (student: StudentRow) => {
+    const raw = (aiExerciseDrafts[student.id] ?? "").trim();
+
+    if (!raw) {
+      setError("Informe o exercício que a IA deve incluir na estrutura vigente.");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await addExercisesToCurrentStructure(student.id, [
+        { name: raw, sets: 3, reps: "10-12", rest_seconds: 60, notes: "" },
+      ]);
+
+      if (!result) {
+        setError(`${student.full_name} não tem estrutura vigente para receber exercícios.`);
+        return;
+      }
+
+      setAiExerciseDrafts((current) => ({ ...current, [student.id]: "" }));
+      await load();
+      setNotice(
+        `Exercício incluído em ${result.block.label} de ${student.full_name}. Estrutura, divisão, regras e ordem das estruturas seguem como o treinador definiu.`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Não foi possível incluir o exercício.");
     } finally {
       setBusy(false);
     }
@@ -590,6 +627,56 @@ function ModelosTreinoPage() {
                             trocar o modelo.
                           </p>
                         )}
+                      </div>
+                    )}
+
+                    {progress && progress.block && (
+                      <div className="space-y-2 rounded-md border border-border px-3 py-2">
+                        <details>
+                          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                            Cronograma das estruturas ({PERIOD_WEEKS} semanas cada)
+                          </summary>
+                          <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
+                            {(assignment ? buildSchedule(assignment) : []).map((entry) => (
+                              <li key={`cronograma-${entry.index}`}>
+                                {entry.index + 1}. {entry.block.label} ·{" "}
+                                {formatDateBR(entry.period_start)} até{" "}
+                                {formatDateBR(entry.period_end)} · {entry.status}
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+
+                        <details>
+                          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                            Regras fixas da estrutura vigente enviadas à IA
+                          </summary>
+                          <pre className="mt-2 whitespace-pre-wrap text-xs text-muted-foreground">
+                            {currentStructureAIContract(progress)}
+                          </pre>
+                        </details>
+
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                          <input
+                            value={aiExerciseDrafts[student.id] ?? ""}
+                            onChange={(event) =>
+                              setAiExerciseDrafts((current) => ({
+                                ...current,
+                                [student.id]: event.target.value,
+                              }))
+                            }
+                            placeholder={`Exercício para ${progress.block.label} (grupos: ${progress.block.muscle_groups || "definir no modelo"})`}
+                            className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void handleStructureExercise(student)}
+                            disabled={busy}
+                            className="rounded-md border border-border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-60"
+                          >
+                            Incluir na estrutura vigente
+                          </button>
+                        </div>
                       </div>
                     )}
 

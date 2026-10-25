@@ -193,6 +193,24 @@ export function structureAIContract(block: SequenceBlock): string {
   ].join("\n");
 }
 
+/**
+ * Regras que valem para a sequência inteira, além da estrutura vigente.
+ * A IA nunca altera estrutura, divisão, regras ou ordem, e não reinicia a sequência.
+ */
+export const SEQUENCE_GUARDRAILS = [
+  "A IA só pode selecionar e incluir exercícios compatíveis com os grupos musculares da estrutura vigente.",
+  "É proibido alterar a estrutura vigente, a divisão muscular, as regras e a ordem das estruturas.",
+  "A sequência não reinicia ao chegar à última estrutura: o aluno permanece nela até a troca manual feita pelo treinador.",
+].join("\n");
+
+export function currentStructureAIContract(progress: StructureProgress): string {
+  if (!progress.block) {
+    return [SEQUENCE_GUARDRAILS, "Nenhuma estrutura vigente atribuída ao aluno."].join("\n");
+  }
+
+  return [structureAIContract(progress.block), SEQUENCE_GUARDRAILS].join("\n");
+}
+
 /** Inclui exercícios gerados pela IA sem tocar em estrutura, divisão, regras ou ordem. */
 export function appendAIExercises(
   block: SequenceBlock,
@@ -365,4 +383,157 @@ export async function assignSequence(
   });
 
   if (error) throw error;
+}
+
+export type AssignmentDbRow = {
+  id: string;
+  student_id: string;
+  sequence_id: string;
+  sequence_name: string;
+  structures: unknown;
+  started_on: string;
+  active: boolean;
+  created_at: string | null;
+};
+
+export function mapAssignmentRow(row: AssignmentDbRow): StudentSequenceRow {
+  return {
+    id: row.id,
+    student_id: row.student_id,
+    sequence_id: row.sequence_id,
+    sequence_name: row.sequence_name,
+    structures: toBlocks(row.structures),
+    start_index: toStartIndex(row.structures),
+    started_on: row.started_on,
+    active: row.active,
+    created_at: row.created_at ?? null,
+  };
+}
+
+/** Grava a cópia das estruturas junto com a posição inicial dentro do jsonb da atribuição. */
+export function toStoredStructures(
+  blocks: SequenceBlock[],
+  startIndex: number,
+): { start_index: number; blocks: SequenceBlock[] } {
+  const safeStart = Math.min(
+    Math.max(Math.floor(Number.isFinite(startIndex) ? startIndex : 0), 0),
+    Math.max(blocks.length - 1, 0),
+  );
+
+  return { start_index: safeStart, blocks: cloneBlocks(blocks) };
+}
+
+/** Atribuição ativa do aluno (a mais recente). */
+export async function getActiveAssignment(studentId: string): Promise<StudentSequenceRow | null> {
+  const { data, error } = await supabase
+    .from("student_training_sequences")
+    .select("id, student_id, sequence_id, sequence_name, structures, started_on, active, created_at")
+    .eq("student_id", studentId)
+    .eq("active", true)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  return data ? mapAssignmentRow(data as unknown as AssignmentDbRow) : null;
+}
+
+export type CurrentStructure = {
+  assignment: StudentSequenceRow;
+  progress: StructureProgress;
+  ai_contract: string;
+};
+
+/** Estrutura vigente do aluno já com o contrato entregue à IA. */
+export async function getCurrentStructure(
+  studentId: string,
+  today: string = todayIso(),
+): Promise<CurrentStructure | null> {
+  const assignment = await getActiveAssignment(studentId);
+  if (!assignment) return null;
+
+  const progress = computeProgress(assignment, today);
+
+  return { assignment, progress, ai_contract: currentStructureAIContract(progress) };
+}
+
+export type AIExerciseResult = {
+  block: SequenceBlock;
+  added: SequenceExercise[];
+  progress: StructureProgress;
+};
+
+/**
+ * Inclusão de exercícios pela IA: grava somente na estrutura vigente da atribuição do aluno.
+ * Nome da estrutura, grupos musculares, divisão, regras e ordem das estruturas ficam intactos.
+ */
+export async function addExercisesToCurrentStructure(
+  studentId: string,
+  generated: SequenceExercise[],
+  today: string = todayIso(),
+): Promise<AIExerciseResult | null> {
+  const assignment = await getActiveAssignment(studentId);
+  if (!assignment) return null;
+
+  const progress = computeProgress(assignment, today);
+  if (!progress.block) return null;
+
+  const cleaned: SequenceExercise[] = generated
+    .map((exercise) => ({
+      name: String(exercise.name ?? "").trim(),
+      sets: Number(exercise.sets ?? 3) || 3,
+      reps: String(exercise.reps ?? "10-12") || "10-12",
+      rest_seconds: Number(exercise.rest_seconds ?? 60) || 60,
+      notes: String(exercise.notes ?? ""),
+    }))
+    .filter((exercise) => exercise.name.length > 0);
+
+  if (cleaned.length === 0) {
+    return { block: progress.block, added: [], progress };
+  }
+
+  const blocks = assignment.structures.map((block, index) =>
+    index === progress.index ? appendAIExercises(block, cleaned) : block,
+  );
+
+  const { error } = await supabase
+    .from("student_training_sequences")
+    .update({ structures: toStoredStructures(blocks, assignment.start_index) as never })
+    .eq("id", assignment.id);
+
+  if (error) throw error;
+
+  return { block: blocks[progress.index], added: cleaned, progress };
+}
+
+export type ScheduleEntry = {
+  index: number;
+  block: SequenceBlock;
+  period_start: string;
+  period_end: string;
+  status: "concluída" | "vigente" | "futura";
+};
+
+/** Cronograma das estruturas a partir da estrutura inicial escolhida (28 dias cada). */
+export function buildSchedule(
+  assignment: Pick<StudentSequenceRow, "started_on" | "start_index" | "structures">,
+  today: string = todayIso(),
+): ScheduleEntry[] {
+  const blocks = assignment.structures;
+  if (blocks.length === 0) return [];
+
+  const startIndex = Math.min(Math.max(assignment.start_index ?? 0, 0), blocks.length - 1);
+  const progress = computeProgress(assignment, today);
+
+  return blocks
+    .map((block, index) => {
+      const periodStart = addDays(assignment.started_on, (index - startIndex) * PERIOD_DAYS);
+      const periodEnd = addDays(periodStart, PERIOD_DAYS);
+      const status: ScheduleEntry["status"] =
+        index < progress.index ? "concluída" : index === progress.index ? "vigente" : "futura";
+
+      return { index, block, period_start: periodStart, period_end: periodEnd, status };
+    })
+    .filter((entry) => entry.index >= startIndex);
 }
