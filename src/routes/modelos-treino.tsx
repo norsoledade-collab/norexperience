@@ -2,16 +2,19 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
-  addDays,
+  PERIOD_DAYS,
+  PERIOD_WEEKS,
   assignSequence,
   cloneBlocks,
+  computeProgress,
   createSequence,
+  emptyBlock,
   formatDateBR,
   listActiveAssignments,
   listSequences,
   listStudents,
   nextTemplateName,
-  todayIso,
+  structureAIContract,
   updateSequence,
   type SequenceBlock,
   type SequenceExercise,
@@ -32,19 +35,14 @@ const newExercise = (): SequenceExercise => ({
   notes: "",
 });
 
-function periodInfo(startedOn: string): { end: string; remaining: number } {
-  const end = addDays(startedOn, 30);
-  const diff = new Date(`${end}T00:00:00`).getTime() - new Date(`${todayIso()}T00:00:00`).getTime();
-  return { end, remaining: Math.ceil(diff / 86_400_000) };
-}
-
 function ModelosTreinoPage() {
   const [sequences, setSequences] = useState<TrainingSequence[]>([]);
   const [students, setStudents] = useState<StudentRow[]>([]);
   const [assignments, setAssignments] = useState<StudentSequenceRow[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<TrainingSequence | null>(null);
-  const [choices, setChoices] = useState<Record<string, string>>({});
+  const [planChoices, setPlanChoices] = useState<Record<string, string>>({});
+  const [startChoices, setStartChoices] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -96,10 +94,12 @@ function ModelosTreinoPage() {
     setNotice(null);
     try {
       const name = nextTemplateName(sequences);
-      const id = await createSequence(name, [{ label: "Treino A", exercises: [] }]);
+      const id = await createSequence(name, [emptyBlock([])]);
       await load();
       setSelectedId(id);
-      setNotice(`Modelo ${name} criado. Agora é só montar os exercícios e salvar.`);
+      setNotice(
+        `Modelo ${name} criado. Monte as estruturas Treino 1, Treino 2... na ordem em que o aluno deve cumpri-las.`,
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Não foi possível criar o modelo.");
     } finally {
@@ -125,26 +125,36 @@ function ModelosTreinoPage() {
 
   const handleAssign = async (student: StudentRow) => {
     const current = assignmentByStudent.get(student.id) ?? null;
-    const sequenceId = choices[student.id] ?? current?.sequence_id ?? selectedId ?? "";
-    const sequence = sequences.find((item) => item.id === sequenceId);
+    const planId = planChoices[student.id] ?? current?.sequence_id ?? selectedId ?? "";
+    const sequence = sequences.find((item) => item.id === planId);
 
     if (!sequence) {
       setError("Selecione um modelo antes de atribuir.");
       return;
     }
 
-    if (current && current.sequence_id === sequence.id) {
-      setNotice(`${student.full_name} já está com o modelo ${sequence.name}.`);
+    if (sequence.structures.length === 0) {
+      setError("O modelo escolhido ainda não tem estruturas cadastradas.");
       return;
     }
+
+    const fallbackStart =
+      current && current.sequence_id === sequence.id ? current.start_index : 0;
+    const startIndex = Math.min(
+      Math.max(startChoices[student.id] ?? fallbackStart, 0),
+      sequence.structures.length - 1,
+    );
+    const block = sequence.structures[startIndex];
 
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      await assignSequence(student.id, sequence);
+      await assignSequence(student.id, sequence, startIndex);
       await load();
-      setNotice(`Modelo ${sequence.name} atribuído para ${student.full_name}. Período de 30 dias iniciado.`);
+      setNotice(
+        `${student.full_name} posicionado em ${block.label} do modelo ${sequence.name}. Cada estrutura vale ${PERIOD_WEEKS} semanas (${PERIOD_DAYS} dias) e o avanço é automático na ordem definida.`,
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Não foi possível atribuir o modelo.");
     } finally {
@@ -165,8 +175,19 @@ function ModelosTreinoPage() {
   const addBlock = () => {
     setDraft((current) => {
       if (!current) return current;
-      const label = `Treino ${String.fromCharCode(65 + current.structures.length)}`;
-      return { ...current, structures: [...current.structures, { label, exercises: [] }] };
+      return { ...current, structures: [...current.structures, emptyBlock(current.structures)] };
+    });
+  };
+
+  const moveBlock = (index: number, direction: -1 | 1) => {
+    setDraft((current) => {
+      if (!current) return current;
+      const target = index + direction;
+      if (target < 0 || target >= current.structures.length) return current;
+      const structures = [...current.structures];
+      const [moved] = structures.splice(index, 1);
+      structures.splice(target, 0, moved);
+      return { ...current, structures };
     });
   };
 
@@ -224,9 +245,12 @@ function ModelosTreinoPage() {
       <div className="mx-auto w-full max-w-6xl space-y-8 px-4 py-10">
         <header className="space-y-2">
           <h1 className="text-3xl font-bold tracking-tight">Modelos de treino</h1>
-          <p className="max-w-2xl text-sm text-muted-foreground">
-            Monte os modelos fixos (Treino 1, Treino 2...) e escolha manualmente qual deles cada aluno
-            deve seguir. Cada atribuição vale por 30 dias e só muda quando o treinador trocar.
+          <p className="max-w-3xl text-sm text-muted-foreground">
+            Monte a sequência fixa de estruturas (Treino 1, Treino 2, Treino 3...) com grupos
+            musculares, divisão e regras. O aluno começa na estrutura escolhida pelo treinador e
+            avança automaticamente para a próxima a cada {PERIOD_WEEKS} semanas ({PERIOD_DAYS}{" "}
+            dias). Depois da última estrutura a sequência não reinicia: o aluno permanece nela até a
+            troca manual.
           </p>
         </header>
 
@@ -259,7 +283,7 @@ function ModelosTreinoPage() {
             <p className="text-sm text-muted-foreground">Carregando modelos...</p>
           ) : sequences.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              Nenhum modelo criado ainda. Use "Novo modelo" para montar o Treino 1.
+              Nenhum modelo criado ainda. Use "Novo modelo" para montar a primeira sequência.
             </p>
           ) : (
             <div className="flex flex-wrap gap-2">
@@ -291,7 +315,9 @@ function ModelosTreinoPage() {
                 <input
                   value={draft.name}
                   onChange={(event) =>
-                    setDraft((current) => (current ? { ...current, name: event.target.value } : current))
+                    setDraft((current) =>
+                      current ? { ...current, name: event.target.value } : current,
+                    )
                   }
                   className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                 />
@@ -302,7 +328,7 @@ function ModelosTreinoPage() {
                   onClick={addBlock}
                   className="rounded-md border border-border px-4 py-2 text-sm font-medium hover:bg-muted"
                 >
-                  Adicionar bloco
+                  Adicionar estrutura
                 </button>
                 <button
                   type="button"
@@ -317,42 +343,117 @@ function ModelosTreinoPage() {
 
             {draft.structures.length === 0 && (
               <p className="text-sm text-muted-foreground">
-                Nenhum bloco neste modelo. Use "Adicionar bloco" para começar.
+                Nenhuma estrutura neste modelo. Use "Adicionar estrutura" para criar o Treino 1.
               </p>
             )}
 
             {draft.structures.map((block, blockIndex) => (
               <div
-                key={`bloco-${blockIndex}`}
+                key={`estrutura-${blockIndex}`}
                 className="space-y-4 rounded-lg border border-border bg-background p-4"
               >
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                  <input
-                    value={block.label}
-                    onChange={(event) => updateBlock(blockIndex, { label: event.target.value })}
-                    placeholder={`Treino ${String.fromCharCode(65 + blockIndex)}`}
-                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-medium sm:max-w-xs"
-                  />
+                  <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center">
+                    <span className="w-fit rounded-full bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
+                      {blockIndex + 1}ª na sequência
+                    </span>
+                    <input
+                      value={block.label}
+                      onChange={(event) => updateBlock(blockIndex, { label: event.target.value })}
+                      placeholder={`Treino ${blockIndex + 1}`}
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-medium sm:max-w-xs"
+                    />
+                  </div>
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
-                      onClick={() => addExercise(blockIndex)}
-                      className="rounded-md border border-border px-3 py-2 text-xs font-medium hover:bg-muted"
+                      onClick={() => moveBlock(blockIndex, -1)}
+                      disabled={blockIndex === 0}
+                      className="rounded-md border border-border px-3 py-2 text-xs font-medium hover:bg-muted disabled:opacity-40"
                     >
-                      Adicionar exercício
+                      Subir
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => moveBlock(blockIndex, 1)}
+                      disabled={blockIndex === draft.structures.length - 1}
+                      className="rounded-md border border-border px-3 py-2 text-xs font-medium hover:bg-muted disabled:opacity-40"
+                    >
+                      Descer
                     </button>
                     <button
                       type="button"
                       onClick={() => removeBlock(blockIndex)}
                       className="rounded-md border border-border px-3 py-2 text-xs font-medium text-destructive hover:bg-destructive/10"
                     >
-                      Remover bloco
+                      Remover estrutura
                     </button>
                   </div>
                 </div>
 
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Grupos musculares
+                    </span>
+                    <input
+                      value={block.muscle_groups}
+                      onChange={(event) =>
+                        updateBlock(blockIndex, { muscle_groups: event.target.value })
+                      }
+                      placeholder="Peito, ombro e tríceps"
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Divisão
+                    </span>
+                    <input
+                      value={block.division}
+                      onChange={(event) => updateBlock(blockIndex, { division: event.target.value })}
+                      placeholder="Empurrar / puxar / pernas"
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                    />
+                  </label>
+                </div>
+
+                <label className="block space-y-1">
+                  <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Regras
+                  </span>
+                  <textarea
+                    value={block.rules}
+                    onChange={(event) => updateBlock(blockIndex, { rules: event.target.value })}
+                    placeholder="4 exercícios, 3 séries de 8-12, 60s de descanso"
+                    className="min-h-[60px] w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                  />
+                </label>
+
+                <details className="rounded-md border border-border bg-muted/40 px-3 py-2">
+                  <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                    Regras fixas enviadas à IA
+                  </summary>
+                  <pre className="mt-2 whitespace-pre-wrap text-xs text-muted-foreground">
+                    {structureAIContract(block)}
+                  </pre>
+                </details>
+
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {block.exercises.length} exercício(s) nesta estrutura
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => addExercise(blockIndex)}
+                    className="rounded-md border border-border px-3 py-2 text-xs font-medium hover:bg-muted"
+                  >
+                    Adicionar exercício
+                  </button>
+                </div>
+
                 {block.exercises.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">Sem exercícios neste bloco.</p>
+                  <p className="text-xs text-muted-foreground">Sem exercícios nesta estrutura.</p>
                 ) : (
                   <div className="space-y-2">
                     {block.exercises.map((exercise, exerciseIndex) => (
@@ -418,9 +519,10 @@ function ModelosTreinoPage() {
 
         <section className="space-y-4 rounded-xl border border-border bg-card p-5 shadow-sm">
           <div className="space-y-1">
-            <h2 className="text-lg font-semibold">Alunos e modelos atribuídos</h2>
+            <h2 className="text-lg font-semibold">Alunos e estrutura atual</h2>
             <p className="text-sm text-muted-foreground">
-              O modelo escolhido vale por 30 dias. A troca é sempre manual, feita pelo treinador.
+              Escolha o modelo e a estrutura inicial de cada aluno. O avanço para a próxima
+              estrutura acontece sozinho a cada {PERIOD_DAYS} dias, na ordem definida no modelo.
             </p>
           </div>
 
@@ -432,8 +534,16 @@ function ModelosTreinoPage() {
             <div className="space-y-3">
               {students.map((student) => {
                 const assignment = assignmentByStudent.get(student.id) ?? null;
-                const info = assignment ? periodInfo(assignment.started_on) : null;
-                const selectValue = choices[student.id] ?? assignment?.sequence_id ?? selectedId ?? "";
+                const progress = assignment ? computeProgress(assignment) : null;
+                const planId = planChoices[student.id] ?? assignment?.sequence_id ?? selectedId ?? "";
+                const plannedSequence = sequences.find((item) => item.id === planId) ?? null;
+                const options = plannedSequence?.structures ?? [];
+                const fallbackStart =
+                  assignment && assignment.sequence_id === planId ? assignment.start_index : 0;
+                const startValue = Math.min(
+                  Math.max(startChoices[student.id] ?? fallbackStart, 0),
+                  Math.max(options.length - 1, 0),
+                );
 
                 return (
                   <div
@@ -442,26 +552,60 @@ function ModelosTreinoPage() {
                   >
                     <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                       <p className="font-medium">{student.full_name}</p>
-                      {assignment && info ? (
+                      {assignment ? (
                         <p className="text-xs text-muted-foreground">
-                          {assignment.sequence_name} · {formatDateBR(assignment.started_on)} até{" "}
-                          {formatDateBR(info.end)} ·{" "}
-                          {info.remaining > 0
-                            ? `${info.remaining} dia(s) restantes`
-                            : "período encerrado"}
+                          Modelo: {assignment.sequence_name}
                         </p>
                       ) : (
                         <p className="text-xs text-muted-foreground">Nenhum modelo atribuído</p>
                       )}
                     </div>
 
-                    <div className="flex flex-col gap-2 sm:flex-row">
+                    {progress && progress.block && (
+                      <div className="space-y-1 rounded-md bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+                        <p className="text-sm font-semibold text-foreground">
+                          {progress.block.label}
+                          {progress.block.muscle_groups ? ` · ${progress.block.muscle_groups}` : ""}
+                        </p>
+                        {progress.block.division && <p>Divisão: {progress.block.division}</p>}
+                        {progress.block.rules && <p>Regras: {progress.block.rules}</p>}
+                        <p>
+                          Período: {formatDateBR(progress.period_start)} até{" "}
+                          {formatDateBR(progress.period_end)} ·{" "}
+                          {progress.finished
+                            ? "sequência concluída"
+                            : progress.days_remaining > 0
+                              ? `${progress.days_remaining} dia(s) restantes`
+                              : "período encerrado"}
+                        </p>
+                        {progress.next_block && progress.passes_on && (
+                          <p>
+                            Próxima estrutura: {progress.next_block.label} a partir de{" "}
+                            {formatDateBR(progress.passes_on)}
+                          </p>
+                        )}
+                        {progress.is_last && !progress.next_block && (
+                          <p>
+                            Última estrutura da sequência — o aluno permanece nela até o treinador
+                            trocar o modelo.
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
                       <select
-                        value={selectValue}
-                        onChange={(event) =>
-                          setChoices((current) => ({ ...current, [student.id]: event.target.value }))
-                        }
-                        className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm sm:max-w-xs"
+                        value={planId}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setPlanChoices((current) => ({ ...current, [student.id]: value }));
+                          setStartChoices((current) => {
+                            const next = { ...current };
+                            delete next[student.id];
+                            return next;
+                          });
+                        }}
+                        className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                       >
                         <option value="">Selecione um modelo</option>
                         {sequences.map((sequence) => (
@@ -470,13 +614,38 @@ function ModelosTreinoPage() {
                           </option>
                         ))}
                       </select>
+
+                      <select
+                        value={String(startValue)}
+                        onChange={(event) =>
+                          setStartChoices((current) => ({
+                            ...current,
+                            [student.id]: Number(event.target.value) || 0,
+                          }))
+                        }
+                        disabled={options.length === 0}
+                        className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm disabled:opacity-60"
+                      >
+                        {options.length === 0 ? (
+                          <option value="0">Sem estruturas no modelo</option>
+                        ) : (
+                          options.map((block, index) => (
+                            <option key={`${block.label}-${index}`} value={index}>
+                              {`${index + 1}. ${block.label}`}
+                            </option>
+                          ))
+                        )}
+                      </select>
+
                       <button
                         type="button"
                         onClick={() => void handleAssign(student)}
-                        disabled={busy}
+                        disabled={busy || options.length === 0}
                         className="rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-60"
                       >
-                        {assignment ? "Trocar modelo" : "Atribuir modelo"}
+                        {assignment && assignment.sequence_id === planId
+                          ? "Reposicionar aluno"
+                          : "Atribuir modelo"}
                       </button>
                     </div>
                   </div>
